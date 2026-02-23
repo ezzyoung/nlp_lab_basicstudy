@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+
+# Virtual environment
+venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Model checkpoints & training outputs
+output/
+logs/
+results/
+cache/
+local_cache/
+submission/
+
+# Dataset & index files
+data/
+*.tsv
+*.tsv.gz
+*.json.gz
+lucene-index*/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+*.zip
+*.tar.gz
