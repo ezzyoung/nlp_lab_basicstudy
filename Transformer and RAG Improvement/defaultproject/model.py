@@ -56,29 +56,19 @@ class TransformerConfig(transformers.PretrainedConfig):
         assert self.hidden_size == (self.num_attention_heads * self.head_dim), "hidden_size must be equal to num_attention_heads * head_dim"
 
 def apply_rotary_emb(x, position_embeddings):
-    cos,sin = position_embeddings
-    # fill here: rotate hidden states with positon angle
-    # shape hint
+    cos, sin = position_embeddings
+    # RoPE: x1,x2 각각에 cos/sin 적용 (x: batch, num_heads, seq_len, head_dim)
     # cos,sin: (batch_size, seq_len, head_dim // 2)
-    # x: (batch_size, num_attention_heads, seq_len, head_dim)
-    # x.pow(2) : 거듭제곱 함수 -> x 의 모든 원소를 제곱하라는 뜻
-    #RMS Norm : 각 토큰의 히든 스테이트 벡터가 너무 크거나 작아지지 않도록 크기를 유지시켜줌, Transformer 각 Layer 안에서 두번 사용
-    #keepdim=True : 차원 축소 방지
-    #(batch, seq, hidden dim) 은 embedding 거치면 행렬상 이렇게 바뀜 ID -> 벡터 되면서
-    #######
-    cos, sin = position_embeddings #튜플로 저장
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
 
-    # head dim 을 절반으로 나눠
-    x1 = x[..., :x.shape[-1] //2 ] #...은 앞에 있는 차원은 x 에서 전부 가져와, 마지막 차원만 자르겠다
-    x2 = x[..., x.shape[-1] // 2:] #뒤 절반
+    cos = cos.unsqueeze(1)  # (batch, 1, seq_len, head_dim//2)
+    sin = sin.unsqueeze(1)
 
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1) #broadcasting 으로 차원을 (batch, 1, seq_len, head_dim//2) 로 맞춤
-
-    rotated = torch.cat([-x2, x1], dim=-1)
-    x = x*cos + rotated*sin
-    #######
-    return x
+    rotated_x1 = x1 * cos - x2 * sin
+    rotated_x2 = x2 * cos + x1 * sin
+    x_rotated = torch.cat([rotated_x1, rotated_x2], dim=-1)
+    return x_rotated
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -467,14 +457,15 @@ class TransformerModel(TransformerPreTrainedModel):
 
         if attention_mask is not None:
             #패딩 위치 0 -> -inf, 실제 위치 1 을 0으로 변환
+            #attention_mask 길이가 target_length보다 짧으면 오른쪽에 1 패딩 (생성 루프에서 새 토큰은 항상 실제)
+            attn_len = attention_mask.shape[1]
+            if attn_len < target_length:
+                pad_right = torch.ones(batch_size, target_length - attn_len, dtype=attention_mask.dtype, device=device)
+                attention_mask = torch.cat([attention_mask, pad_right], dim=-1)
             pad_mask = (1.0 - attention_mask[:, None, None, :].float()) * torch.finfo(dtype).min
-            #attention_mask[:, None, None, :].float()) 은 unsqueeze 와 같아서 1 추가 곧 차원확장 -> (batch, 1, 1, target_length)
-            #target_length 기준으로 패딩 마스크 
-
-            #pad mask shape 가 (batch, 1, 1, target_length) 인 이유는 Attention 가중치 shape 가 (batch, num_heads, seq_len, seq_len) 이기 때문
-            # 여기에다 더해야 하므로 shape 호환 후 broadcasting 으로 확장
             pad_mask_full = torch.zeros(batch_size, 1, sequence_length, target_length, dtype=dtype, device=device)
-            pad_mask_full[:, :, :, seen_token_length:] += (1.0 - attention_mask[:, None, None, :].float()) * torch.finfo(dtype).min
+            pad_mask_slice = pad_mask[:, :, :, seen_token_length:target_length]
+            pad_mask_full[:, :, :, seen_token_length:] = pad_mask_slice
             mask = mask + pad_mask_full
             mask = torch.clamp(mask, min=torch.finfo(dtype).min) #clamp 로 특정 범위 안에 값 유지 제한
 
