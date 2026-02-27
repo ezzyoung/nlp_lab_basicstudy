@@ -6,19 +6,6 @@ Asai et al. 2024 "Self-RAG: Learning to Retrieve, Generate, and Critique through
 - 생성 중 reflection: [Relevant], [Fully supported], [Utility:X] 등 출력
 - [Generate] 토큰: 답변 생성 전 사용
 - 반복적 검색: 생성 중 [Retrieval] 재출력 시 추가 검색
-
-과제(NQ) 사용법:
-  1. NQ 로드: nq_train = load_from_disk(".../nq_train"), nq_dev = load_from_disk(".../nq_dev")
-  2. add_selfrag_tokens(tokenizer, model)
-  3. Critic 라벨: critic_for_labels=CriticModel(pretrained_gpt, tokenizer) 또는 None(휴리스틱)
-  4. CriticDataset(tokenizer, nq_train, retriever, critic_for_labels=...) → train_critic()
-  5. CriticModel(trained_critic, tokenizer) → SelfRAGDataset(critic=...) (critic 필수)
-  6. train_selfrag() → Generator 학습 (NQ)
-  7. ModelRAGTrainedSelfRAG.retrieval_augmented_generate()
-
-평가 시: ModelRAGTrainedSelfRAG 사용 시 eval_for_rag에서
-  pred = model.decode_outputs_for_eval(outputs)
-  로 답변만 추출하여 사용 (skip_special_tokens=True 대신)
 """
 
 from model_rag import ModelRAG
@@ -29,7 +16,7 @@ from typing import List, Optional, Tuple, Callable
 from datasets import Dataset as HF_Dataset
 
 
-# ── 논문 Self-RAG 특수 토큰 (공식 형식) ────────────────────────────────────
+# 공식 특수 토큰
 
 SELF_RAG_TOKENS = [
     "[Retrieval]", "[No Retrieval]", "[Generate]",
@@ -49,7 +36,7 @@ def add_selfrag_tokens(tokenizer, model):
         "additional_special_tokens": SELF_RAG_TOKENS
     })
     if num_added > 0 and model is not None:
-        model.resize_token_embeddings(len(tokenizer))
+        model.resize_token_embeddings(len(tokenizer)) #허깅페이스에 있는 토큰 크기 조절
     return num_added
 
 
@@ -58,12 +45,12 @@ def _build_context(passages: List[dict]) -> str:
     parts = []
     for p in passages:
         title = p.get("title", "")
-        text = p.get("text", p.get("contents", ""))
+        text = p.get("contents", "")
         parts.append(f"Title: {title} Passage: {text}")
     return "\n".join(parts)
 
 
-# ── Critic (논문 정렬) ──────────────────────────────────────────────────────
+#Critic 
 
 class CriticModel:
     """
@@ -132,75 +119,12 @@ class CriticModel:
         return f"[Utility:{result}]" if isinstance(result, int) else "[Utility:3]"
 
 
-# ── 휴리스틱 Critic (Critic 모델 없을 때 fallback) ───────────────────────────
-
-def _normalize(s: str) -> str:
-    return " ".join(s.lower().split())
-
-
-def _is_answer_in_passage(answer: str, passage_text: str) -> bool:
-    na = _normalize(answer)
-    np = _normalize(passage_text)
-    return na in np or any(_normalize(a) in np for a in na.split() if len(a) > 2)
-
-
-def _question_passage_overlap(question: str, passage_text: str) -> float:
-    qw = set(_normalize(question).split())
-    pw = set(_normalize(passage_text).split())
-    return len(qw & pw) / len(qw) if qw else 0.0
-
-
-def get_critic_labels_heuristic(
-    question: str,
-    answer: str,
-    passages: List[dict],
-    gold_passage: Optional[dict] = None,
-) -> Tuple[List[str], str, str]:
-    """
-    휴리스틱 Critic 라벨 (논문 토큰 형식)
-    Returns: rel_labels, sup_label, use_label
-    """
-    rel_labels = []
-    for p in passages:
-        text = p.get("text", p.get("contents", ""))
-        is_gold = gold_passage and text == gold_passage.get("text", gold_passage.get("contents", ""))
-        overlap = _question_passage_overlap(question, text)
-        rel_labels.append("[Relevant]" if is_gold or overlap > 0.2 else "[Irrelevant]")
-
-    has_support = False
-    partial = False
-    if gold_passage:
-        gt = gold_passage.get("text", gold_passage.get("contents", ""))
-        if _is_answer_in_passage(answer, gt):
-            has_support = True
-        else:
-            partial = any(_is_answer_in_passage(answer, p.get("text", p.get("contents", ""))) for p in passages)
-    else:
-        for p in passages:
-            pt = p.get("text", p.get("contents", ""))
-            if _is_answer_in_passage(answer, pt):
-                has_support = True
-                break
-            if any(w in _normalize(pt) for w in _normalize(answer).split() if len(w) > 3):
-                partial = True
-
-    if has_support:
-        sup_label, use_label = "[Fully supported]", "[Utility:5]"
-    elif partial:
-        sup_label, use_label = "[Partially supported]", "[Utility:4]"
-    else:
-        sup_label, use_label = "[No support]", "[Utility:2]"
-
-    return rel_labels, sup_label, use_label
-
-
-# ── Critic 학습 (논문 Step 1~2) ──────────────────────────────────────────────
+# Critic 학습
 
 class CriticDataset(torch.utils.data.Dataset):
     """
     Critic 학습 데이터: (prompt, label_token) 쌍
     과제: NQ 데이터 사용
-    라벨: critic_for_labels(GPT 모델) 사용 시 해당 모델로 생성, 없으면 휴리스틱 (논문은 GPT-4)
     """
 
     def __init__(
@@ -230,7 +154,7 @@ class CriticDataset(torch.utils.data.Dataset):
         for idx in range(len(self.dataset)):
             sample = self.dataset[idx]
             question = sample["question"]
-            answer = sample["answers"][0]
+            answer = sample["answers"]
             gold_ctx = sample.get("positive_ctxs", [{}])[0] if sample.get("positive_ctxs") else None
 
             hits = self.retriever.search(question, self.num_passages)
@@ -240,10 +164,6 @@ class CriticDataset(torch.utils.data.Dataset):
                 rel_labels = [self.critic_for_labels.is_relevant(question, p) for p in passages]
                 sup_label = self.critic_for_labels.is_supported(question, answer, passages)
                 use_label = self.critic_for_labels.utility(question, answer)
-            else:
-                rel_labels, sup_label, use_label = get_critic_labels_heuristic(
-                    question, answer, passages, gold_ctx
-                )
 
             for p, rel in zip(passages, rel_labels):
                 ctx = _build_context([p])
@@ -338,7 +258,7 @@ def train_critic(
     return model
 
 
-# ── Self-RAG 학습 데이터셋 ──────────────────────────────────────────────────
+# 학습 데이터셋
 
 class SelfRAGDataset(torch.utils.data.Dataset):
     """
@@ -435,7 +355,7 @@ class SelfRAGCollator:
         }
 
 
-# ── 학습된 Self-RAG (ModelRAG 상속) ─────────────────────────────────────────
+#학습된 self rag
 
 def _extract_answer_from_selfrag_output(decoded: str) -> str:
     """
@@ -586,7 +506,7 @@ class ModelRAGTrainedSelfRAG(ModelRAG):
         return torch.tensor(padded, dtype=torch.long, device=self.model.device)
 
 
-# ── 학습 함수 ─────────────────────────────────────────────────────────────
+# 학습 함수
 
 def train_selfrag(
     model,

@@ -13,19 +13,20 @@ import numpy as np
 from typing import List, Optional
 import re
 
-
+#a : (dim,) -> 질문 벡터 1개
+#b: (n, dim) -> 문서 벡터 n개
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """a: (dim,), b: (n, dim) -> (n,)"""
     a_norm = a / (np.linalg.norm(a) + 1e-9)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9) #axis=1 이면 각 행을 하나의 벡터로 보고 노름 계산, keepdims 해야 차원 1로 유지
     return np.dot(b_norm, a_norm)
 
 
 def _split_sentences(text: str) -> List[str]:
-    """간단한 문장 분리 (nltk 없이)"""
+    """문장단위로 분리하는 함수"""
     if not text or not text.strip():
         return []
-    # . ! ? 로 분리, 최소 길이 필터
+    # . ! ? 로 분리
     parts = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in parts if len(s.strip()) > 15]
 
@@ -34,7 +35,7 @@ class ImprovedRAG(BaselineRAG):
     """
     Context Compression RAG (BaselineRAG 상속)
     - BM25로 더 많이 검색 (retrieve_k) → Semantic reranking → 상위 keep_k개
-    - 각 passage 내 문장별 질문-관련도로 압축 (instruction-aware)
+    - 각 passage 내 문장별 질문-관련도로 압축 
     - Few-shot 유지
     """
 
@@ -53,46 +54,19 @@ class ImprovedRAG(BaselineRAG):
         self._encoder = None
 
     def _get_encoder(self):
-        """Lazy load embedding model"""
         if self._encoder is not None:
             return self._encoder
         try:
             from sentence_transformers import SentenceTransformer
             self._encoder = SentenceTransformer(self.embedding_model_name)
             print(f"ImprovedRAG: sentence-transformers 로드 ({self.embedding_model_name})")
+            return self._encoder
         except ImportError:
-            # Fallback: transformers + mean pooling
-            import torch
-            from transformers import AutoModel, AutoTokenizer
-            self._tokenizer_enc = AutoTokenizer.from_pretrained(self.embedding_model_name)
-            self._model_enc = AutoModel.from_pretrained(self.embedding_model_name)
-            self._encoder = ("transformers", self._tokenizer_enc, self._model_enc)
-            print(f"ImprovedRAG: transformers fallback ({self.embedding_model_name})")
-        return self._encoder
+            raise ImportError("sentence-transformers 설치")
 
     def _encode(self, texts: List[str]) -> np.ndarray:
         """텍스트 리스트를 임베딩 (batch)"""
         enc = self._get_encoder()
-        if isinstance(enc, tuple):
-            # transformers fallback
-            _, tokenizer, model = enc
-            import torch
-            inputs = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="pt",
-            )
-            device = next(model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                out = model(**inputs)
-            mask = inputs["attention_mask"]
-            last_hidden = out.last_hidden_state
-            masked = last_hidden * mask.unsqueeze(-1)
-            emb = masked.sum(1) / (mask.sum(1, keepdim=True).float() + 1e-9)
-            return emb.cpu().numpy().astype(np.float32)
         return enc.encode(texts, convert_to_numpy=True)
 
     def _compress_passage(
@@ -106,12 +80,12 @@ class ImprovedRAG(BaselineRAG):
         """
         sentences = _split_sentences(passage_text)
         if len(sentences) <= top_k_sentences:
-            return passage_text
+            return " ".join(sentences)
 
-        query_emb = self._encode([query])[0]
+        query_emb = self._encode([query])[0]#그 실제 질문 벡터
         sent_embs = self._encode(sentences)
         scores = _cosine_similarity(query_emb, sent_embs)
-        top_idx = np.argsort(scores)[-top_k_sentences:]
+        top_idx = np.argsort(scores)[-top_k_sentences:] #argsort 는 오름차순이니 큰거 뽑으려먼 -topk
         selected = [sentences[i] for i in sorted(top_idx)]
         return " ".join(selected)
 
@@ -136,7 +110,7 @@ class ImprovedRAG(BaselineRAG):
                 list_input_text.append(input_text)
                 continue
 
-            # 1) Semantic reranking
+            # reranking
             passage_texts = [
                 p.get("contents", p.get("text", ""))
                 for p in passages
@@ -144,10 +118,11 @@ class ImprovedRAG(BaselineRAG):
             query_emb = self._encode([query])[0]
             passage_embs = self._encode(passage_texts)
             scores = _cosine_similarity(query_emb, passage_embs)
-            top_indices = np.argsort(scores)[-keep_k:][::-1]
+            top_indices = np.argsort(scores)[-keep_k:][::-1] #뽑아서 거꾸로 정렬 가장 유사 passage 먼저
+            #np.argsort 는 점수가 아니라 인덱스
 
-            # 2) Instruction-aware compression per passage
-            context_parts = []
+            # compression per passage
+            context_parts = [] #최종 context 에 들어갈 문자열 담은 리스트
             for idx in top_indices:
                 p = passages[idx]
                 title = p.get("title", "")
